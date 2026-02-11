@@ -29,6 +29,7 @@
   <div class="mode" id="modeLabel">AUTO ORBIT</div>
   <div id="controls">Tab to toggle · Scroll to zoom</div>
 </div>
+<!-- Vertex Shader -->
 <script id="vertexShader" type="x-shader/x-vertex">
 varying vec2 vUv;
 void main() {
@@ -36,6 +37,8 @@ void main() {
     gl_Position = vec4(position.xy, 0.0, 1.0);
 }
 </script>
+
+<!-- Fragment Shader: Schwarzschild Geodesic Black Hole -->
 <script id="fragmentShader" type="x-shader/x-fragment">
 precision highp float;
 
@@ -46,6 +49,7 @@ uniform vec2  iResolution;
 uniform vec2  iMouse;
 uniform vec3  iCamera;    // x=theta, y=phi, z=distance
 
+// ─── Constants ─────────────────────────────────────────────
 #define PI        3.14159265359
 #define TWO_PI    6.28318530718
 #define RS        1.0
@@ -53,6 +57,7 @@ uniform vec3  iCamera;    // x=theta, y=phi, z=distance
 #define DISK_INNER 2.0
 #define DISK_OUTER 7.0
 
+// ─── Hash / noise helpers ──────────────────────────────────
 float hash(float n) { return fract(sin(n) * 43758.5453123); }
 float hash2(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }
 float hash3(vec3 p) { return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453123); }
@@ -81,6 +86,7 @@ float fbm(vec3 p) {
     return v;
 }
 
+// ─── Starfield ─────────────────────────────────────────────
 vec3 starfield(vec3 rd, vec3 camOffset) {
     vec3 col = vec3(0.0);
 
@@ -134,6 +140,7 @@ vec3 starfield(vec3 rd, vec3 camOffset) {
     return col;
 }
 
+// ─── Accretion disk color ──────────────────────────────────
 vec3 diskColor(float r, float phi, float side) {
     // Normalize radius to [0,1] within disk bounds
     float t = clamp((r - DISK_INNER) / (DISK_OUTER - DISK_INNER), 0.0, 1.0);
@@ -187,10 +194,12 @@ vec3 diskColor(float r, float phi, float side) {
     return baseColor * dopplerShift * intensity * doppler4 * structure * edgeFade;
 }
 
+// ─── Main rendering ────────────────────────────────────────
 void main() {
     vec2 fragCoord = vUv * iResolution;
     vec2 uv = (fragCoord - 0.5 * iResolution) / iResolution.y;
 
+    // ── Camera setup (driven by uniforms) ──
     float camTheta = iCamera.x;
     float camPhi   = iCamera.y;
     float camDist  = iCamera.z;
@@ -209,17 +218,23 @@ void main() {
     float fov = 1.2;
     vec3 rd = normalize(forward * fov + uv.x * right + uv.y * up);
 
-    // Binet equation for null geodesics: d²u/dφ² = -u + (3/2)u²
+    // ── Project ray into orbital plane via Schwarzschild geodesic ──
+    // Using the Binet equation for null geodesics:
+    //   d²u/dφ² = -u + (3/2)u²
     // where u = Rs/r, integrated via leapfrog method
+
+    // Distance from camera to black hole center
     vec3 toCenter = -camPos;
     float camR = length(camPos);
 
+    // Angular momentum direction (normal to orbital plane)
     vec3 h = cross(camPos, rd);
     float hLen = length(h);
 
     vec3 finalColor = vec3(0.0);
 
     if (hLen < 1e-6) {
+        // Ray aimed directly at or away from center — radial ray
         float closest = dot(rd, normalize(toCenter)) * camR;
         if (closest > 0.0 && camR < 50.0) {
             finalColor = vec3(0.0); // hits center
@@ -229,36 +244,46 @@ void main() {
     } else {
         vec3 normal = h / hLen;
 
+        // Tangent frame in orbital plane
         vec3 e1 = normalize(camPos);
         vec3 e2 = normalize(cross(normal, e1));
 
-        float u = RS / camR;
+        // Initial conditions in orbital plane
+        float u = RS / camR;  // u = Rs / r
         float phi = 0.0;
 
+        // du/dphi from the projection of ray direction
         float rdDotE1 = dot(rd, e1);
         float rdDotE2 = dot(rd, e2);
         float phiDot_sign = sign(rdDotE2);
 
+        // du/dphi from initial ray direction
         float duDphi = -u * rdDotE1 / (rdDotE2 + 1e-10);
 
-        // Impact parameter: 1/b² = (du/dφ)² + u² - u³; critical = 4/27
+        // Analytic impact parameter: 1/b² = (du/dφ)² + u² - u³
+        // Critical value for Schwarzschild: 1/b_c² = 4/27
         float invB2 = duDphi * duDphi + u * u - u * u * u;
-        float criticalInvB2 = 4.0 / 27.0;
+        float criticalInvB2 = 4.0 / 27.0;  // ≈ 0.14815
         bool analyticCapture = (invB2 > criticalInvB2);
 
+        // Integration step (base)
         float baseDphi = 0.015 * phiDot_sign;
 
+        // Accretion disk accumulation
         vec3 diskAccum = vec3(0.0);
         float diskAlpha = 0.0;
         float prevY = camPos.y;
         int crossings = 0;
 
+        // Track closest approach for Einstein ring
         float minU = u;
         float maxU = u;
 
+        // Leapfrog integration
         float u_vel = duDphi;
         float dphi = baseDphi;
 
+        // Half-step velocity
         float accel = -u + 1.5 * u * u;
         u_vel += 0.5 * dphi * accel;
 
