@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gargantua — Interstellar Black Hole</title>
+<style>
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    color: rgba(255,255,255,0.6); font: 13px/1.5 monospace; text-align: center;
+    pointer-events: none; transition: opacity 0.3s;
+  }
+  #hud .mode { color: rgba(255,200,100,0.9); font-size: 14px; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="hud">
+  <div class="mode" id="modeLabel">AUTO ORBIT</div>
+  <div id="controls">Tab to toggle · Scroll to zoom</div>
+</div>
+<script id="vertexShader" type="x-shader/x-vertex">
+varying vec2 vUv;
+void main() {
+    vUv = uv;
+    gl_Position = vec4(position.xy, 0.0, 1.0);
+}
+</script>
+<script id="fragmentShader" type="x-shader/x-fragment">
+precision highp float;
+
+varying vec2 vUv;
+
+uniform float iTime;
+uniform vec2  iResolution;
+uniform vec2  iMouse;
+uniform vec3  iCamera;    // x=theta, y=phi, z=distance
+
+#define PI        3.14159265359
+#define TWO_PI    6.28318530718
+#define RS        1.0
+#define MAX_STEPS 512
+#define DISK_INNER 2.0
+#define DISK_OUTER 7.0
+
+float hash(float n) { return fract(sin(n) * 43758.5453123); }
+float hash2(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }
+float hash3(vec3 p) { return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453123); }
+
+float noise(vec3 p) {
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float n = i.x + i.y * 157.0 + 113.0 * i.z;
+    return mix(
+        mix(mix(hash(n + 0.0),   hash(n + 1.0),   f.x),
+            mix(hash(n + 157.0), hash(n + 158.0), f.x), f.y),
+        mix(mix(hash(n + 113.0), hash(n + 114.0), f.x),
+            mix(hash(n + 270.0), hash(n + 271.0), f.x), f.y),
+        f.z
+    );
+}
+
+float fbm(vec3 p) {
+    float v = 0.0, a = 0.5;
+    for (int i = 0; i < 5; i++) {
+        v += a * noise(p);
+        p = p * 2.03 + vec3(0.31, 0.13, 0.27);
+        a *= 0.5;
+    }
+    return v;
+}
+
+vec3 starfield(vec3 rd, vec3 camOffset) {
+    vec3 col = vec3(0.0);
+
+    // Parallax: shift background based on camera position (normalized by distance)
+    vec3 camDir = normalize(camOffset);
+    float camLen = length(camOffset);
+    vec3 parallax = camDir * camLen * 0.08;
+
+    // Nebula background — animated drift + parallax
+    float slowTime = iTime * 0.02;
+    float n = fbm(rd * 3.0 + parallax * 0.4 + vec3(slowTime, slowTime * 0.7, slowTime * 0.3));
+    float n2 = fbm(rd * 5.0 + parallax * 0.25 + vec3(3.7 - slowTime * 0.5, 1.2, -slowTime * 0.4));
+    float n3 = fbm(rd * 4.0 + parallax * 0.3 + vec3(1.5, 2.8 + slowTime * 0.3, slowTime * 0.6));
+    col += vec3(0.04, 0.02, 0.06) * smoothstep(0.35, 0.75, n);
+    col += vec3(0.02, 0.03, 0.06) * smoothstep(0.4, 0.8, n2);
+    col += vec3(0.03, 0.02, 0.01) * smoothstep(0.3, 0.7, n3);
+
+    // Three star layers with parallax (closer layers shift more)
+    for (int layer = 0; layer < 3; layer++) {
+        float scale = (layer == 0) ? 60.0 : (layer == 1) ? 150.0 : 300.0;
+        float brightness = (layer == 0) ? 0.3 : (layer == 1) ? 0.7 : 1.2;
+        float threshold = (layer == 0) ? 0.96 : (layer == 1) ? 0.975 : 0.99;
+        float pStrength = (layer == 0) ? 0.15 : (layer == 1) ? 0.07 : 0.02;
+
+        vec3 shifted = rd + camOffset * pStrength;
+        vec3 cell = floor(shifted * scale);
+        vec3 frac_part = fract(shifted * scale);
+
+        float h = hash3(cell + float(layer) * 100.0);
+        if (h > threshold) {
+            vec3 starPos = vec3(hash3(cell + 1.0), hash3(cell + 2.0), hash3(cell + 3.0));
+            float d = length(frac_part - starPos);
+            float size = (layer == 0) ? 0.18 : (layer == 1) ? 0.12 : 0.08;
+            float star = smoothstep(size, 0.0, d);
+
+            // Color variation
+            float temp = hash3(cell + 5.0);
+            vec3 starCol;
+            if (temp < 0.25) starCol = vec3(0.7, 0.85, 1.0);      // Blue-white
+            else if (temp < 0.55) starCol = vec3(1.0, 1.0, 0.95);  // White
+            else if (temp < 0.8) starCol = vec3(1.0, 0.9, 0.65);   // Yellow
+            else starCol = vec3(1.0, 0.65, 0.4);                    // Orange-red
+
+            // Twinkle
+            float twinkle = 0.8 + 0.2 * sin(iTime * (1.0 + hash3(cell + 7.0) * 3.0) + hash3(cell + 9.0) * TWO_PI);
+
+            col += star * starCol * brightness * twinkle;
+        }
+    }
+
+    return col;
+}
+
+vec3 diskColor(float r, float phi, float side) {
+    // Normalize radius to [0,1] within disk bounds
+    float t = clamp((r - DISK_INNER) / (DISK_OUTER - DISK_INNER), 0.0, 1.0);
+
+    // Temperature gradient: hot inner to cool outer
+    vec3 innerColor = vec3(1.1, 1.1, 1.3);     // White-blue hot core
+    vec3 midColor   = vec3(1.1, 0.65, 0.2);    // Orange
+    vec3 outerColor = vec3(0.4, 0.08, 0.01);   // Deep red
+
+    vec3 baseColor;
+    if (t < 0.3) {
+        baseColor = mix(innerColor, midColor, t / 0.3);
+    } else {
+        baseColor = mix(midColor, outerColor, (t - 0.3) / 0.7);
+    }
+
+    // Intensity falloff
+    float intensity = pow(1.0 - t, 2.0) * 1.0 + 0.05;
+
+    // Doppler beaming: approaching side is brighter and blue-shifted
+    float orbital_v = 0.55 / sqrt(r);  // Keplerian velocity proxy
+    float doppler = 1.0 + orbital_v * sin(phi);
+    float doppler4 = pow(doppler, 3.0);
+
+    // Doppler color shift — strong blue on approach, red on recession
+    vec3 dopplerShift = mix(vec3(1.0, 0.6, 0.35), vec3(0.6, 0.85, 1.4), clamp(doppler * 0.5, 0.0, 1.0));
+
+    // Procedural swirl noise — more pronounced spiral arms and hot spots
+    float diskTime = iTime * 0.08;
+    float angle = phi + diskTime;
+    float spiral = fbm(vec3(
+        r * 2.5 + cos(angle * 4.0) * 0.8,
+        sin(angle * 6.0) * 0.8 + r * 1.5,
+        r * 1.0 - diskTime * 0.6
+    ));
+    float detail = fbm(vec3(
+        r * 10.0 + cos(angle * 9.0) * 1.2,
+        sin(angle * 13.0) * 1.2,
+        r * 5.0 + iTime * 0.04
+    ));
+    // Spiral arm pattern
+    float arms = sin(angle * 3.0 - r * 2.5) * 0.5 + 0.5;
+    arms = pow(arms, 0.6);
+
+    float structure = 0.4 + 0.35 * spiral + 0.15 * detail + 0.2 * arms;
+
+    // Edge softness
+    float edgeFade = smoothstep(DISK_INNER, DISK_INNER + 0.6, r)
+                   * smoothstep(DISK_OUTER, DISK_OUTER - 0.8, r);
+
+    return baseColor * dopplerShift * intensity * doppler4 * structure * edgeFade;
+}
+
+void main() {
+    vec2 fragCoord = vUv * iResolution;
+    vec2 uv = (fragCoord - 0.5 * iResolution) / iResolution.y;
+
+    float camTheta = iCamera.x;
+    float camPhi   = iCamera.y;
+    float camDist  = iCamera.z;
+    vec3 camPos = camDist * vec3(
+        sin(camTheta) * cos(camPhi),
+        cos(camTheta),
+        sin(camTheta) * sin(camPhi)
+    );
+
+    vec3 target = vec3(0.0);
+    vec3 forward = normalize(target - camPos);
+    vec3 worldUp = vec3(0.0, 1.0, 0.0);
+    vec3 right = normalize(cross(forward, worldUp));
+    vec3 up = cross(right, forward);
+
+    float fov = 1.2;
+    vec3 rd = normalize(forward * fov + uv.x * right + uv.y * up);
+
+    // Binet equation for null geodesics: d²u/dφ² = -u + (3/2)u²
+    // where u = Rs/r, integrated via leapfrog method
+    vec3 toCenter = -camPos;
+    float camR = length(camPos);
+
+    vec3 h = cross(camPos, rd);
+    float hLen = length(h);
+
+    vec3 finalColor = vec3(0.0);
+
+    if (hLen < 1e-6) {
+        float closest = dot(rd, normalize(toCenter)) * camR;
+        if (closest > 0.0 && camR < 50.0) {
+            finalColor = vec3(0.0); // hits center
+        } else {
+            finalColor = starfield(rd, camPos);
+        }
+    } else {
+        vec3 normal = h / hLen;
+
+        vec3 e1 = normalize(camPos);
+        vec3 e2 = normalize(cross(normal, e1));
+
+        float u = RS / camR;
+        float phi = 0.0;
+
+        float rdDotE1 = dot(rd, e1);
+        float rdDotE2 = dot(rd, e2);
+        float phiDot_sign = sign(rdDotE2);
+
+        float duDphi = -u * rdDotE1 / (rdDotE2 + 1e-10);
+
+        // Impact parameter: 1/b² = (du/dφ)² + u² - u³; critical = 4/27
+        float invB2 = duDphi * duDphi + u * u - u * u * u;
+        float criticalInvB2 = 4.0 / 27.0;
+        bool analyticCapture = (invB2 > criticalInvB2);
+
+        float baseDphi = 0.015 * phiDot_sign;
+
+        vec3 diskAccum = vec3(0.0);
+        float diskAlpha = 0.0;
+        float prevY = camPos.y;
+        int crossings = 0;
+
+        float minU = u;
+        float maxU = u;
+
+        float u_vel = duDphi;
+        float dphi = baseDphi;
+
+        float accel = -u + 1.5 * u * u;
+        u_vel += 0.5 * dphi * accel;
+
+        bool absorbed = false;
+
+        for (int i = 0; i < MAX_STEPS; i++) {
+            // Adaptive step: smaller only very close to event horizon
+            dphi = baseDphi * mix(1.0, 0.4, smoothstep(0.5, 0.9, u));
+
+            // Update position
+            phi += dphi;
+            u += dphi * u_vel;
+
+            // Update acceleration & velocity
+            accel = -u + 1.5 * u * u;
+            u_vel += dphi * accel;
+
+            // Track extremes
+            maxU = max(maxU, u);
+            if (u > 0.0) minU = min(minU, u);
+
+            // Event horizon check
+            if (u >= 1.0) {
+                absorbed = true;
+                break;
+            }
+
+            // Escaped ray
+            if (u <= 0.0) {
+                break;
+            }
+
+            // Current 3D position along the geodesic
+            float r = RS / u;
+            vec3 pos = r * (cos(phi) * e1 + sin(phi) * e2);
+            float curY = dot(pos, vec3(0.0, 1.0, 0.0));
+
+            // Disk plane crossing detection (y = 0)
+            int maxCross = analyticCapture ? 1 : 3;
+            if (i > 2 && prevY * curY < 0.0 && crossings < maxCross) {
+                float crossR = r;
+
+                if (crossR > DISK_INNER * 0.9 && crossR < DISK_OUTER * 1.05) {
+                    vec3 crossPos = pos;
+                    float diskPhi = atan(crossPos.z, crossPos.x) + iTime * 0.08;
+
+                    vec3 dCol = diskColor(crossR, diskPhi, sign(prevY));
+
+                    // Gravitational redshift
+                    float redshift = sqrt(max(1.0 - RS / crossR, 0.0));
+                    dCol *= redshift;
+
+                    // Higher-order images are slightly dimmer but still bright
+                    float orderDim = (crossings == 0) ? 1.0 : (crossings == 1) ? 0.7 : 0.4;
+
+                    // Composite (front-to-back)
+                    float alpha = 0.8 * smoothstep(DISK_INNER, DISK_INNER + 0.8, crossR)
+                                     * smoothstep(DISK_OUTER, DISK_OUTER - 1.0, crossR)
+                                     * orderDim;
+                    diskAccum += dCol * alpha * (1.0 - diskAlpha);
+                    diskAlpha += alpha * (1.0 - diskAlpha);
+                    crossings++;
+                }
+            }
+            prevY = curY;
+        }
+
+        // ── Compose final pixel ──
+
+        // Use analytic criterion for the shadow boundary
+        if (!absorbed && analyticCapture) {
+            absorbed = true;
+        }
+
+        if (absorbed) {
+            // Black hole shadow with razor-thin photon ring at edge
+            float edgeProximity = criticalInvB2 / max(invB2, 1e-10);
+            float photonRing = pow(smoothstep(0.92, 1.0, edgeProximity), 20.0) * 1.8;
+            vec3 ringColor = vec3(1.0, 0.9, 0.7) * photonRing;
+
+            // Show disk in front of shadow + photon ring
+            finalColor = diskAccum + ringColor * (1.0 - diskAlpha);
+        } else {
+            // Ray escaped — find final direction for starfield
+            float finalR = (u > 0.0) ? RS / u : 100.0;
+            vec3 finalPos = finalR * (cos(phi) * e1 + sin(phi) * e2);
+            vec3 finalDir = normalize(finalPos);
+
+            vec3 stars = starfield(finalDir, camPos);
+
+            // Einstein ring: razor-thin bright ring at the shadow boundary
+            float einsteinGlow = 0.0;
+            if (maxU > 0.58) {
+                einsteinGlow = pow(smoothstep(0.58, 0.665, maxU), 16.0) * 0.7;
+            }
+            vec3 ringCol = vec3(1.0, 0.9, 0.7) * einsteinGlow;
+
+            finalColor = diskAccum + (stars + ringCol) * (1.0 - diskAlpha);
+        }
+    }
+
+    // Tone mapping (Reinhard)
+    finalColor = finalColor / (1.0 + finalColor);
+
+    // Warm color grade — subtle golden shift like Interstellar
+    finalColor = pow(finalColor, vec3(0.95, 1.0, 1.08));
+    finalColor *= vec3(1.05, 1.0, 0.92);
+
+    // Slight expansion for bloom
+    finalColor *= 1.15;
+
+    gl_FragColor = vec4(finalColor, 1.0);
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+// ─── Renderer ──────────────────────────────────────────────
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+document.body.appendChild(renderer.domElement);
+
+// ─── Scene & Camera ────────────────────────────────────────
+const scene = new THREE.Scene();
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+// ─── Shader uniforms ───────────────────────────────────────
+const uniforms = {
+    iTime:       { value: 0.0 },
+    iResolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
+    iMouse:      { value: new THREE.Vector2(0.0, 0.0) },
+    iCamera:     { value: new THREE.Vector3(1.35, 0.0, 14.0) }  // theta, phi, dist
+};
+
+// ─── Fullscreen quad ───────────────────────────────────────
+const shaderMaterial = new THREE.ShaderMaterial({
+    vertexShader: document.getElementById('vertexShader').textContent,
+    fragmentShader: document.getElementById('fragmentShader').textContent,
+    uniforms,
+    depthWrite: false,
+    depthTest: false
+});
+
+const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), shaderMaterial);
+scene.add(quad);
+
+// ─── Post-processing ───────────────────────────────────────
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+
+const bloomPass = new UnrealBloomPass(
+    new THREE.Vector2(window.innerWidth, window.innerHeight),
+    0.7,    // strength
+    0.6,    // radius
+    0.35    // threshold
+);
+composer.addPass(bloomPass);
+composer.addPass(new OutputPass());
+
+// ─── Camera state ───────────────────────────────────────────
+let camTheta = 1.35;     // elevation
+let camPhi = 0.0;        // azimuth
+let camDist = 14.0;      // distance
+let autoOrbitSpeed = 0.05;
+let manualMode = false;
+
+const modeLabel = document.getElementById('modeLabel');
+const controlsLabel = document.getElementById('controls');
+
+function updateHUD() {
+    if (manualMode) {
+        modeLabel.textContent = 'MANUAL · WASD + Drag';
+        controlsLabel.textContent = 'Tab to auto-orbit · Q/E or Scroll to zoom';
+    } else {
+        modeLabel.textContent = 'AUTO ORBIT';
+        controlsLabel.textContent = 'Tab for manual · Scroll to zoom';
+    }
+}
+updateHUD();
+
+// ─── Keyboard controls ─────────────────────────────────────
+const keys = {};
+window.addEventListener('keydown', (e) => {
+    if (e.key === 'Tab') {
+        e.preventDefault();
+        manualMode = !manualMode;
+        updateHUD();
+        return;
+    }
+    keys[e.key.toLowerCase()] = true;
+    if ('wasdqe'.includes(e.key.toLowerCase())) manualMode = true;
+    updateHUD();
+});
+window.addEventListener('keyup', (e) => {
+    keys[e.key.toLowerCase()] = false;
+});
+
+// ─── Mouse drag controls ───────────────────────────────────
+let isDragging = false;
+let prevMouseX = 0, prevMouseY = 0;
+
+window.addEventListener('mousedown', (e) => {
+    isDragging = true;
+    prevMouseX = e.clientX;
+    prevMouseY = e.clientY;
+});
+window.addEventListener('mouseup', () => { isDragging = false; });
+window.addEventListener('mousemove', (e) => {
+    if (isDragging) {
+        const dx = e.clientX - prevMouseX;
+        const dy = e.clientY - prevMouseY;
+        camPhi -= dx * 0.005;
+        camTheta = Math.max(0.15, Math.min(Math.PI - 0.15, camTheta - dy * 0.005));
+        prevMouseX = e.clientX;
+        prevMouseY = e.clientY;
+        manualMode = true;
+        updateHUD();
+    }
+});
+
+// Scroll to zoom
+window.addEventListener('wheel', (e) => {
+    camDist = Math.max(5.0, Math.min(30.0, camDist + e.deltaY * 0.01));
+    lastInputTime = performance.now();
+}, { passive: true });
+
+// Touch support
+let prevTouchX = 0, prevTouchY = 0;
+window.addEventListener('touchstart', (e) => {
+    if (e.touches.length > 0) {
+        prevTouchX = e.touches[0].clientX;
+        prevTouchY = e.touches[0].clientY;
+        manualMode = true;
+        updateHUD();
+    }
+}, { passive: true });
+window.addEventListener('touchmove', (e) => {
+    if (e.touches.length > 0) {
+        const dx = e.touches[0].clientX - prevTouchX;
+        const dy = e.touches[0].clientY - prevTouchY;
+        camPhi -= dx * 0.005;
+        camTheta = Math.max(0.15, Math.min(Math.PI - 0.15, camTheta - dy * 0.005));
+        prevTouchX = e.touches[0].clientX;
+        prevTouchY = e.touches[0].clientY;
+    }
+}, { passive: true });
+
+// ─── Resize handler ────────────────────────────────────────
+window.addEventListener('resize', () => {
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    renderer.setSize(w, h);
+    composer.setSize(w, h);
+    uniforms.iResolution.value.set(w, h);
+});
+
+// ─── Animation loop ────────────────────────────────────────
+const clock = new THREE.Clock();
+
+function animate() {
+    requestAnimationFrame(animate);
+
+    const dt = clock.getDelta();
+    const elapsed = clock.getElapsedTime();
+    uniforms.iTime.value = elapsed;
+
+    // WASD controls (always responsive)
+    const rotSpeed = 1.2 * dt;
+    const zoomSpeed = 8.0 * dt;
+    if (keys['a']) camPhi += rotSpeed;
+    if (keys['d']) camPhi -= rotSpeed;
+    if (keys['w']) camTheta = Math.max(0.15, camTheta - rotSpeed);
+    if (keys['s']) camTheta = Math.min(Math.PI - 0.15, camTheta + rotSpeed);
+    if (keys['q'] || keys['='] || keys['+']) camDist = Math.max(5.0, camDist - zoomSpeed);
+    if (keys['e'] || keys['-']) camDist = Math.min(30.0, camDist + zoomSpeed);
+
+    // Auto-orbit in auto mode
+    if (!manualMode) {
+        camPhi += autoOrbitSpeed * dt;
+    }
+
+    // Update camera uniform
+    uniforms.iCamera.value.set(camTheta, camPhi, camDist);
+
+    composer.render();
+}
+
+animate();
+</script>
+</body>
+</html>
